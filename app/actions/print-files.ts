@@ -15,7 +15,7 @@ export class AIPrintFileGenerator {
     this.openai = new OpenAI({
       apiKey: process.env.NEXT_PUBLIC_OPENAI_API_KEY!,
     });
-    const geminiKey = process.env.GEMINI_API_KEY || "AIzaSyD24uduKj1_YD8eVsYV9rJRe6TYGmn5UrY";
+    const geminiKey = process.env.GEMINI_API_KEY;
     this.gemini = new GoogleGenAI({ apiKey: geminiKey });
   }
 
