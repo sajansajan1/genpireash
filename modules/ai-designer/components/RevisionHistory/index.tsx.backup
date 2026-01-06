@@ -1,0 +1,671 @@
+/**
+ * RevisionHistory component for managing design revisions
+ */
+
+import React, { useState } from 'react';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Button } from '@/components/ui/button';
+import { History, Clock, ChevronDown, ChevronRight, Info, Eye, Layers, X, Calendar, Hash, FileText, Trash2, ArrowRight, Loader2 } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { motion, AnimatePresence } from 'framer-motion';
+import type { MultiViewRevision } from '../../types';
+
+interface RevisionHistoryProps {
+  revisions: MultiViewRevision[];
+  onRollback: (revision: MultiViewRevision) => void;
+  onDelete: (revisionId: string) => Promise<boolean>;
+  onToggle?: () => void;
+  isLoading?: boolean;
+  onGenerateTechPack?: () => void;
+  isGeneratingTechPack?: boolean;
+}
+
+// Modal component for revision details
+function RevisionDetailModal({
+  revision,
+  isOpen,
+  onClose,
+  onRollback,
+  formatContent,
+}: {
+  revision: MultiViewRevision | null;
+  isOpen: boolean;
+  onClose: () => void;
+  onRollback: (revision: MultiViewRevision) => void;
+  formatContent: (content: string) => string;
+}) {
+  if (!revision) return null;
+
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <>
+          {/* Backdrop */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50"
+            onClick={onClose}
+          />
+
+          {/* Modal */}
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95 }}
+            transition={{ duration: 0.15 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          >
+            <div className="w-full max-w-2xl h-[80vh] bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden flex flex-col">
+              {/* Header */}
+              <div className="px-6 py-4 border-b border-gray-200 bg-gray-50/50">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 bg-gray-100 rounded-lg">
+                      <Layers className="h-4 w-4 text-gray-600" />
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-semibold text-gray-900">
+                        Revision Details
+                      </h3>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        {revision.editType === 'initial' ? 'Original Design' : 'AI Generated Design'}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={onClose}
+                    className="p-1.5 hover:bg-gray-100 rounded-lg transition-colors"
+                  >
+                    <X className="h-5 w-5 text-gray-500" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Content */}
+              <ScrollArea className="flex-1 overflow-y-auto">
+                <div className="px-6 py-4 space-y-5">
+                  {/* Preview Images */}
+                  <div>
+                    <h4 className="text-sm font-medium text-gray-700 mb-3 flex items-center gap-2">
+                      <Eye className="h-3.5 w-3.5" />
+                      Design Views
+                    </h4>
+                    {/* First row: Front, Back, Side */}
+                    <div className="grid grid-cols-3 gap-3">
+                      {revision.views ? (
+                        <>
+                          <div className="space-y-2">
+                            <div className="text-xs font-medium text-gray-600 text-center">Front View</div>
+                            <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                              {revision.views.front?.imageUrl ? (
+                                <img
+                                  src={revision.views.front.imageUrl}
+                                  alt="Front view"
+                                  className="w-full h-full object-contain p-2"
+                                />
+                              ) : (
+                                <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                                  <span className="text-sm font-medium">FRONT</span>
+                                  <span className="text-xs mt-1">Not generated</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="text-xs font-medium text-gray-600 text-center">Back View</div>
+                            <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                              {revision.views.back?.imageUrl ? (
+                                <img
+                                  src={revision.views.back.imageUrl}
+                                  alt="Back view"
+                                  className="w-full h-full object-contain p-2"
+                                />
+                              ) : (
+                                <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                                  <span className="text-sm font-medium">BACK</span>
+                                  <span className="text-xs mt-1">Not generated</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="space-y-2">
+                            <div className="text-xs font-medium text-gray-600 text-center">Side View</div>
+                            <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                              {revision.views.side?.imageUrl ? (
+                                <img
+                                  src={revision.views.side.imageUrl}
+                                  alt="Side view"
+                                  className="w-full h-full object-contain p-2"
+                                />
+                              ) : (
+                                <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                                  <span className="text-sm font-medium">SIDE</span>
+                                  <span className="text-xs mt-1">Not generated</span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="col-span-3 py-8 text-center text-gray-400">
+                          No preview images available
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Second row: Top and Bottom views */}
+                    {revision.views && (revision.views.top?.imageUrl || revision.views.bottom?.imageUrl) && (
+                      <div className="grid grid-cols-2 gap-3 mt-3 max-w-md mx-auto">
+                        <div className="space-y-2">
+                          <div className="text-xs font-medium text-gray-600 text-center">Top View</div>
+                          <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                            {revision.views.top?.imageUrl ? (
+                              <img
+                                src={revision.views.top.imageUrl}
+                                alt="Top view"
+                                className="w-full h-full object-contain p-2"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                                <span className="text-sm font-medium">TOP</span>
+                                <span className="text-xs mt-1">Not generated</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          <div className="text-xs font-medium text-gray-600 text-center">Bottom View</div>
+                          <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                            {revision.views.bottom?.imageUrl ? (
+                              <img
+                                src={revision.views.bottom.imageUrl}
+                                alt="Bottom view"
+                                className="w-full h-full object-contain p-2"
+                              />
+                            ) : (
+                              <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                                <span className="text-sm font-medium">BOTTOM</span>
+                                <span className="text-xs mt-1">Not generated</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Edit Prompt */}
+                  {revision.editPrompt && revision.editPrompt !== 'Original design' && (
+                    <div>
+                      <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
+                        <FileText className="h-3.5 w-3.5" />
+                        Edit Prompt
+                      </h4>
+                      <div className="bg-gray-50 rounded-lg p-3 border border-gray-200">
+                        <p className="text-sm text-gray-600 whitespace-pre-wrap">
+                          {formatContent(revision.editPrompt)}
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Metadata Grid */}
+                  <div>
+                    <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
+                      <Info className="h-3.5 w-3.5" />
+                      Information
+                    </h4>
+                    <div className="bg-gray-50 rounded-lg p-3 space-y-2 border border-gray-200">
+                      <div className="flex items-start gap-2">
+                        <Hash className="h-3.5 w-3.5 text-gray-400 mt-0.5" />
+                        <div className="flex-1">
+                          <span className="text-xs font-medium text-gray-600">Revision ID</span>
+                          <p className="text-xs text-gray-500 font-mono mt-0.5">{revision.id}</p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-start gap-2">
+                        <Calendar className="h-3.5 w-3.5 text-gray-400 mt-0.5" />
+                        <div className="flex-1">
+                          <span className="text-xs font-medium text-gray-600">Created</span>
+                          <p className="text-xs text-gray-500 mt-0.5">
+                            {new Date(revision.createdAt).toLocaleString('en-US', {
+                              weekday: 'long',
+                              year: 'numeric',
+                              month: 'long',
+                              day: 'numeric',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit'
+                            })}
+                          </p>
+                        </div>
+                      </div>
+
+                      {revision.editPrompt && revision.editPrompt !== 'Original design' && (
+                        <div className="flex items-start gap-2">
+                          <FileText className="h-3.5 w-3.5 text-gray-400 mt-0.5" />
+                          <div className="flex-1">
+                            <span className="text-xs font-medium text-gray-600">Prompt Statistics</span>
+                            <p className="text-xs text-gray-500 mt-0.5">
+                              {revision.editPrompt.length} characters • {revision.editPrompt.split(' ').length} words
+                            </p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Status Badge */}
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-gray-500">Status:</span>
+                      {revision.isActive ? (
+                        <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-700 border border-gray-300">
+                          Active Version
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-gray-50 text-gray-600 border border-gray-200">
+                          Previous Version
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </ScrollArea>
+
+              {/* Footer - Only show if there's an action button */}
+              {!revision.isActive && (
+                <div className="px-6 py-4 border-t border-gray-200 bg-gray-50/50">
+                  <div className="flex items-center justify-end">
+                    <button
+                      onClick={() => {
+                        onRollback(revision);
+                        onClose();
+                      }}
+                      className="px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white text-sm font-medium rounded-lg transition-colors"
+                    >
+                      Activate This Revision
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// Component for individual revision item
+function RevisionItem({
+  revision,
+  onRollback,
+  onDelete,
+  formatContent,
+  onShowDetails,
+}: {
+  revision: MultiViewRevision;
+  onRollback: (revision: MultiViewRevision) => void;
+  onDelete: (revisionId: string) => Promise<boolean>;
+  formatContent: (content: string) => string;
+  onShowDetails: (revision: MultiViewRevision) => void;
+}) {
+  const [isPromptExpanded, setIsPromptExpanded] = useState(false);
+
+  const hasEditPrompt = revision.editPrompt && revision.editPrompt !== 'Original design';
+  const shouldTruncate = hasEditPrompt && revision.editPrompt && revision.editPrompt.length > 100;
+
+  return (
+    <div
+      className={cn(
+        'relative bg-white rounded-xl border-2 transition-all duration-200',
+        revision.isActive
+          ? 'border-gray-400 shadow-md cursor-default'
+          : 'border-gray-200 hover:border-gray-300 cursor-pointer hover:bg-gray-50/30 hover:shadow-lg'
+      )}
+      onClick={(e) => {
+        // Don't trigger rollback if clicking on interactive elements
+        if ((e.target as HTMLElement).closest('.prompt-toggle') ||
+            (e.target as HTMLElement).closest('.details-toggle') ||
+            (e.target as HTMLElement).closest('.delete-button')) return;
+        if (!revision.isActive) onRollback(revision);
+      }}
+    >
+      {/* Active indicator */}
+      {revision.isActive && (
+        <div className="absolute -top-2 -right-2 z-10">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gray-600 text-white">
+            <span className="text-xs font-bold">✓</span>
+          </span>
+        </div>
+      )}
+
+      <div className="p-4">
+        {/* Thumbnail Images */}
+        <div className="grid grid-cols-3 gap-2 mb-3">
+          {revision.views ? (
+            <>
+              <div className="relative group">
+                <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                  {revision.views.front?.imageUrl ? (
+                    <img
+                      src={revision.views.front.imageUrl}
+                      alt="Front view"
+                      className="w-full h-full object-contain p-1"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                      <span className="text-[10px] font-medium">FRONT</span>
+                    </div>
+                  )}
+                </div>
+                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/5 rounded-lg transition-colors" />
+              </div>
+
+              <div className="relative group">
+                <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                  {revision.views.back?.imageUrl ? (
+                    <img
+                      src={revision.views.back.imageUrl}
+                      alt="Back view"
+                      className="w-full h-full object-contain p-1"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                      <span className="text-[10px] font-medium">BACK</span>
+                    </div>
+                  )}
+                </div>
+                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/5 rounded-lg transition-colors" />
+              </div>
+
+              <div className="relative group">
+                <div className="aspect-square bg-gradient-to-br from-gray-50 to-gray-100 rounded-lg overflow-hidden border border-gray-200">
+                  {revision.views.side?.imageUrl ? (
+                    <img
+                      src={revision.views.side.imageUrl}
+                      alt="Side view"
+                      className="w-full h-full object-contain p-1"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex flex-col items-center justify-center text-gray-400">
+                      <span className="text-[10px] font-medium">SIDE</span>
+                    </div>
+                  )}
+                </div>
+                <div className="absolute inset-0 bg-black/0 group-hover:bg-black/5 rounded-lg transition-colors" />
+              </div>
+            </>
+          ) : (
+            <div className="col-span-3 aspect-[3/1] bg-gray-100 rounded-lg flex items-center justify-center">
+              <span className="text-xs text-gray-400">No preview available</span>
+            </div>
+          )}
+        </div>
+
+        {/* Revision Info */}
+        <div className="space-y-2">
+          {/* Title and Status */}
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex-1">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-gray-900">
+                  {revision.editType === 'initial' ? 'Original' : 'Generated'}
+                </span>
+                {revision.isActive && (
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">
+                    Active
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Edit Prompt with expand/collapse */}
+          {hasEditPrompt && (
+            <div className="bg-gray-50 rounded-md px-2 py-1.5">
+              {shouldTruncate ? (
+                <div className="flex items-start gap-1.5">
+                  <button
+                    className="prompt-toggle flex-shrink-0 p-0.5 hover:bg-gray-200/70 rounded transition-all duration-150"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setIsPromptExpanded(!isPromptExpanded);
+                    }}
+                    aria-label={isPromptExpanded ? "Collapse" : "Expand"}
+                  >
+                    {isPromptExpanded ? (
+                      <ChevronDown className="h-3 w-3 text-gray-500" />
+                    ) : (
+                      <ChevronRight className="h-3 w-3 text-gray-500" />
+                    )}
+                  </button>
+                  <span className={cn(
+                    "text-xs text-gray-600 flex-1 leading-relaxed",
+                    !isPromptExpanded && "line-clamp-2"
+                  )}>
+                    {formatContent(revision.editPrompt || '')}
+                  </span>
+                </div>
+              ) : (
+                <span className="text-xs text-gray-600 leading-relaxed">
+                  {revision.editPrompt ? formatContent(revision.editPrompt) : ''}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Timestamp and Actions */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1 text-xs text-gray-400">
+              <Clock className="h-3 w-3" />
+              {new Date(revision.createdAt).toLocaleDateString('en-US', {
+                month: 'numeric',
+                day: 'numeric',
+                year: 'numeric'
+              })}, {new Date(revision.createdAt).toLocaleTimeString('en-US', {
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+              })}
+            </div>
+            <div className="flex items-center gap-1">
+              <button
+                className="details-toggle flex items-center gap-1 px-2 py-1 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded transition-all duration-150"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onShowDetails(revision);
+                }}
+                aria-label="Show details"
+              >
+                <Info className="h-3 w-3" />
+                <span>Details</span>
+              </button>
+              {!revision.isActive && (
+                <button
+                  className="delete-button flex items-center gap-1 px-2 py-1 text-xs text-red-500 hover:text-red-700 hover:bg-red-50 rounded transition-all duration-150"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    if (confirm(`Are you sure you want to delete Revision #${revision.revisionNumber}?`)) {
+                      await onDelete(revision.id);
+                    }
+                  }}
+                  aria-label="Delete revision"
+                >
+                  <Trash2 className="h-3 w-3" />
+                  <span>Delete</span>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function RevisionHistory({
+  revisions,
+  onRollback,
+  onDelete,
+  onToggle,
+  isLoading = false,
+  onGenerateTechPack,
+  isGeneratingTechPack = false,
+}: RevisionHistoryProps) {
+  const [selectedRevision, setSelectedRevision] = useState<MultiViewRevision | null>(null);
+  const [showModal, setShowModal] = useState(false);
+
+  // Sort revisions by date, newest first
+  const sortedRevisions = [...revisions].sort((a, b) =>
+    new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+
+  const handleShowDetails = (revision: MultiViewRevision) => {
+    setSelectedRevision(revision);
+    setShowModal(true);
+  };
+
+  const handleCloseModal = () => {
+    setShowModal(false);
+    setTimeout(() => setSelectedRevision(null), 200);
+  };
+
+  // Format content to shorten URLs
+  const formatContent = (content: string) => {
+    // Regular expression to match URLs
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+
+    return content.replace(urlRegex, (url) => {
+      // If URL is short enough, don't modify it
+      if (url.length <= 20) {
+        return url;
+      }
+
+      // Extract the first 10 chars and last 7 chars
+      const firstPart = url.substring(0, 10);
+      const lastPart = url.substring(url.length - 7);
+
+      return `${firstPart}...${lastPart}`;
+    });
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-gray-50/50 overflow-hidden">
+      <div className="p-4 border-b bg-white flex-shrink-0">
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-2">
+            <History className="h-4 w-4 text-gray-600" />
+            <h3 className="font-semibold text-gray-900">Revision History</h3>
+          </div>
+          {onToggle && (
+            <button
+              onClick={onToggle}
+              className="p-1.5 bg-gray-100 hover:bg-gray-200 rounded-lg transition-all group"
+              aria-label="Hide revision history"
+            >
+              <ArrowRight className="h-4 w-4 text-gray-600 group-hover:text-gray-800 transition-colors" />
+            </button>
+          )}
+        </div>
+        <span className="text-xs text-gray-500">
+          {revisions.length} revision{revisions.length !== 1 ? 's' : ''} (all views)
+        </span>
+      </div>
+
+      <ScrollArea className="flex-1 overflow-hidden">
+        <div className="h-full">
+          {isLoading ? (
+            // Loading skeleton - show only one
+            <div className="p-4">
+              <div className="bg-white rounded-lg p-3 border border-gray-200 animate-pulse">
+                <div className="flex items-start justify-between mb-2">
+                  <div className="h-4 bg-gray-200 rounded w-24"></div>
+                  <div className="h-6 bg-gray-200 rounded-full w-16"></div>
+                </div>
+                <div className="flex gap-2 mb-2">
+                  {[1, 2, 3].map((j) => (
+                    <div key={j} className="h-12 w-12 bg-gray-200 rounded"></div>
+                  ))}
+                </div>
+                <div className="space-y-2">
+                  <div className="h-3 bg-gray-200 rounded w-3/4"></div>
+                  <div className="h-3 bg-gray-200 rounded w-1/2"></div>
+                </div>
+                <div className="flex justify-between items-center mt-3">
+                  <div className="h-3 bg-gray-200 rounded w-20"></div>
+                  <div className="flex gap-2">
+                    <div className="h-8 bg-gray-200 rounded w-16"></div>
+                    <div className="h-8 bg-gray-200 rounded w-16"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : sortedRevisions.length === 0 ? (
+            <div className="p-6 text-center text-gray-500">
+              <div className="text-4xl mb-2 opacity-20">📜</div>
+              <div className="text-sm">No revisions yet</div>
+              <div className="text-xs mt-1 text-gray-400">
+                Your design history will appear here
+              </div>
+            </div>
+          ) : (
+            <div className="p-4 space-y-3">
+              {sortedRevisions.map((revision) => (
+                <RevisionItem
+                  key={revision.id}
+                  revision={revision}
+                  onRollback={onRollback}
+                  onDelete={onDelete}
+                  formatContent={formatContent}
+                  onShowDetails={handleShowDetails}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </ScrollArea>
+
+      {/* Generate Tech Pack Button */}
+      {onGenerateTechPack && (
+        <div className="p-4 border-t bg-white flex-shrink-0">
+          <Button
+            onClick={onGenerateTechPack}
+            disabled={isGeneratingTechPack}
+            className="w-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white shadow-md disabled:opacity-50"
+          >
+            {isGeneratingTechPack ? (
+              <>
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                Generating Tech Pack...
+              </>
+            ) : (
+              <>
+                <FileText className="h-4 w-4 mr-2" />
+                Generate Tech Pack
+              </>
+            )}
+          </Button>
+        </div>
+      )}
+
+      {/* Revision Detail Modal */
+      <RevisionDetailModal
+        revision={selectedRevision}
+        isOpen={showModal}
+        onClose={handleCloseModal}
+        onRollback={onRollback}
+        formatContent={formatContent}
+      />
+    </div>
+  );
+}
+
+export default RevisionHistory;

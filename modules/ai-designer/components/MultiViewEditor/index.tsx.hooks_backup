@@ -1,0 +1,2193 @@
+/**
+ * Main MultiViewEditor component (modular version)
+ * Orchestrates all sub-components with Zustand store
+ */
+
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+// Removed Dialog imports - not needed for full-screen layout
+import { Button } from "@/components/ui/button";
+import { devLog, devLogOnce } from "../../utils/devLogger";
+import { motion, AnimatePresence } from "framer-motion";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ViewsDisplay } from "../ViewsDisplay";
+import { ChatInterface } from "../ChatInterface";
+import { RevisionHistory } from "../RevisionHistory";
+import { ErrorBoundary } from "../common/ErrorBoundary";
+import { FrontViewApproval } from "../FrontViewApproval";
+import { ProgressiveViewsGeneration } from "../ProgressiveViewsGeneration";
+import { CreativeLoadingAnimation } from "../CreativeLoadingAnimation";
+import { useEditorStore } from "../../store/editorStore";
+import { useChatStore } from "../../store/chatStore";
+import { useChatMessages } from "../../hooks/useChatMessages";
+import { extractProductNameAction } from "@/app/actions/extract-product-name";
+import {
+  generateFrontViewOnly,
+  handleFrontViewDecision,
+  generateRemainingViews,
+  createRevisionAfterApproval,
+} from "@/app/actions/progressive-generation-workflow";
+import { useUserStore } from "@/lib/zustand/useStore";
+import {
+  Box,
+  X,
+} from "lucide-react";
+import {
+  History,
+  MessageSquare,
+  Wand2,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { GenpireLogo } from "@/components/ui/genpire-logo";
+import type { MultiViewEditorProps, ViewType } from "../../types";
+import { GenerationProgressModal } from "@/components/generation-progress-modal";
+import { sendTechPackCreation } from "@/app/actions/send-mail";
+import { GenerationProgressIndicator } from "@/components/generation-progress-indicator";
+import { useGetCreditsStore } from "@/lib/zustand/credits/getCredits";
+import {
+  getUserProducts,
+  type UserProduct,
+} from "@/app/actions/get-user-products";
+import dynamic from "next/dynamic";
+
+// Dynamically import 3D viewer component (client-side only)
+const Model3DViewer = dynamic(
+  () =>
+    import("@/components/3d-viewer/Model3DViewer").then(
+      (mod) => mod.Model3DViewer
+    ),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex items-center justify-center h-[600px]">
+        Loading 3D viewer...
+      </div>
+    ),
+  }
+);
+import { useRouter } from "next/navigation";
+
+// Extracted modular components
+import { CreditsDisplay } from "./CreditsDisplay";
+import { LoadingOverlay } from "./LoadingOverlay";
+import { FloatingControls } from "./FloatingControls";
+import { BottomControlsBar } from "./BottomControlsBar";
+import { EditorHeader } from "./EditorHeader";
+
+// Custom business logic hooks
+import { useProductManagement } from "../../hooks/business-logic/useProductManagement";
+import { useTechPackGeneration } from "../../hooks/business-logic/useTechPackGeneration";
+import { use3DModelViewer } from "../../hooks/business-logic/use3DModelViewer";
+
+export function MultiViewEditor(props: MultiViewEditorProps) {
+  const {
+    isOpen,
+    onClose,
+    productId,
+    productName = "Product",
+    productDescription = "",
+    currentViews: initialViews,
+    revisions: initialRevisions,
+    isInitialGeneration = false,
+    initialPrompt = "",
+    onEditViews,
+    onProgressiveEdit,
+    onGenerateInitialImages,
+    onRollback,
+    onDeleteRevision,
+    onRevisionsChange,
+    onGenerateTechPack,
+    setShowIndicatorModal,
+    setShowTutorialModal,
+  } = props;
+
+  // Local state for selected revision
+  const [selectedRevision, setSelectedRevision] = useState<any>(null);
+  const [extractedProductName, setExtractedProductName] = useState<
+    string | null
+  >(null);
+  const [revisionsLoading, setRevisionsLoading] = useState(false);
+  const [isGeneratingTechPack, setIsGeneratingTechPack] = useState(false);
+  const [techPackGeneratedFor, setTechPackGeneratedFor] = useState<
+    string | null
+  >(null);
+  const [revisionTechPacks, setRevisionTechPacks] = useState<
+    Record<string, boolean>
+  >({});
+  const [mobileActiveTab, setMobileActiveTab] = useState<string>("views");
+  const [userProducts, setUserProducts] = useState<UserProduct[]>([]);
+  const [isProductDropdownOpen, setIsProductDropdownOpen] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [has3DModel, setHas3DModel] = useState(false);
+  const [model3DUrl, setModel3DUrl] = useState<string | null>(null);
+  const [show3DViewer, setShow3DViewer] = useState(false);
+  const [frontViewVersions, setFrontViewVersions] = useState<
+    Array<{
+      id: string;
+      frontViewUrl: string;
+      iterationNumber: number;
+      createdAt: string;
+    }>
+  >([]);
+  const [isCheckingApproval, setIsCheckingApproval] = useState(false); // Only true when actually checking
+  const [isCleaningSession, setIsCleaningSession] = useState(false); // True when cleaning on close
+  // Store references
+  const viewsDisplayRef = useRef<HTMLDivElement>(null);
+  const initialGenerationTriggered = useRef(false);
+  const isInitialGenerationSetRef = useRef(false);
+  const generationInProgress = useRef(false); // Track if generation is currently running
+  // Use Zustand store - RealtimeCreditsProvider handles real-time updates
+  const { getCreatorCredits, refresCreatorCredits } = useGetCreditsStore();
+  const credits = getCreatorCredits;
+  const refetch = refresCreatorCredits;
+  // Store state
+  const {
+    setProductInfo,
+    setCurrentViews,
+    setRevisions,
+    currentViews,
+    revisions,
+    showHistory,
+    toggleHistory,
+    isVisualEditMode,
+    setVisualEditMode,
+    viewport,
+    setViewport,
+    loadingViews,
+    setAllLoadingViews,
+    setLoadingView,
+    setIsInitialGeneration,
+    // Progressive generation workflow state
+    workflowMode,
+    setWorkflowMode,
+    generationState,
+    setGenerationState,
+    frontViewApproval,
+    setFrontViewApproval,
+    updateViewProgress,
+    resetWorkflowState,
+  } = useEditorStore();
+
+  const {
+    isProcessing,
+    setIsProcessing,
+    reset: resetChatStore,
+  } = useChatStore();
+
+  // Memoize computed values to prevent unnecessary re-renders
+  const currentViewsEmpty = useMemo(
+    () => Object.values(currentViews).every((v) => !v || v === ""),
+    [currentViews]
+  );
+
+  const actualIsInitialGeneration = useMemo(
+    () => currentViewsEmpty && initialRevisions.length === 0,
+    [currentViewsEmpty, initialRevisions.length]
+  );
+
+  // Log initial generation status (after store is initialized) - only once
+  devLogOnce(
+    "multiview-mount",
+    `🎯 MultiViewEditor Component Mounted - productId: ${productId}`
+  );
+
+  // Get user data from store
+  const { user, refreshUserCredits } = useUserStore();
+
+  // Callback to refresh both credits and revisions after successful generation
+  const handleRevisionSuccess = useCallback(async () => {
+    // Refresh user credits
+    if (refreshUserCredits) {
+      await refreshUserCredits();
+    }
+
+    // Reload revisions to update the UI
+    if (productId) {
+      try {
+        const { getGroupedMultiViewRevisions } = await import(
+          "@/app/actions/ai-image-edit-new-table"
+        );
+        // Skip cache to get fresh data from database
+        const revisionsResult = await getGroupedMultiViewRevisions(productId, true);
+
+        if (revisionsResult.success && revisionsResult.revisions) {
+          setRevisions(revisionsResult.revisions);
+
+          if (onRevisionsChange) {
+            onRevisionsChange(revisionsResult.revisions);
+          }
+
+          devLog(
+            "revisions-refreshed",
+            { count: revisionsResult.revisions.length },
+            "Revisions reloaded after generation"
+          );
+        }
+      } catch (error) {
+        console.error("Failed to reload revisions:", error);
+      }
+    }
+  }, [refreshUserCredits, productId, onRevisionsChange, setRevisions]);
+
+  // Custom hooks
+  const { sendUserMessage, sendMessage } = useChatMessages(
+    productId,
+    productName,
+    handleRevisionSuccess
+  );
+
+  // Calculate if the system is busy (processing or loading)
+  const isSystemBusy =
+    isProcessing || Object.values(loadingViews).some((loading) => loading);
+
+  useEffect(() => {
+    if (!credits) {
+      refetch();
+    }
+  }, [credits, refetch]);
+
+  // Fetch user products for the dropdown
+  useEffect(() => {
+    const fetchProducts = async () => {
+      devLog("fetch-products", "Fetching user products...");
+      const result = await getUserProducts();
+      if (result.success && result.products) {
+        devLog(
+          "fetch-products",
+          `✅ Loaded ${result.products.length} products`
+        );
+        setUserProducts(result.products);
+      } else {
+        console.error("❌ Failed to fetch products:", result.error);
+      }
+    };
+    fetchProducts();
+  }, []);
+
+  // CRITICAL: Clear Zustand store state when productId changes
+  // This prevents old product views from showing when starting a new product
+  const previousProductIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    // If productId changed (not just initial mount)
+    if (
+      previousProductIdRef.current !== null &&
+      previousProductIdRef.current !== productId
+    ) {
+      console.log("🔄 Product ID changed - clearing all Zustand store state");
+      console.log(`  Previous: ${previousProductIdRef.current}`);
+      console.log(`  New: ${productId}`);
+
+      // Clear ALL views in store immediately
+      setCurrentViews({
+        front: "",
+        back: "",
+        side: "",
+        top: "",
+        bottom: "",
+      });
+
+      // Clear revisions
+      setRevisions([]);
+
+      // Reset workflow state
+      resetWorkflowState();
+
+      // Clear loading states
+      setAllLoadingViews(false);
+
+      // Clear local state
+      setFrontViewVersions([]);
+      initialGenerationTriggered.current = false;
+
+      devLog(
+        "product-change-cleanup",
+        { oldId: previousProductIdRef.current, newId: productId },
+        "Cleared all state for new product"
+      );
+    }
+
+    // Update previous productId reference
+    previousProductIdRef.current = productId;
+  }, [
+    productId,
+    setCurrentViews,
+    setRevisions,
+    resetWorkflowState,
+    setAllLoadingViews,
+  ]);
+
+  // Check if product has 3D model
+  useEffect(() => {
+    const check3DModel = async () => {
+      if (!productId) return;
+
+      try {
+        const response = await fetch(
+          `/api/product-3d-models?sourceType=product&sourceId=${productId}`
+        );
+        const result = await response.json();
+
+        if (result.success && result.model && result.model.model_urls?.glb) {
+          setHas3DModel(true);
+          setModel3DUrl(result.model.model_urls.glb);
+        } else {
+          setHas3DModel(false);
+          setModel3DUrl(null);
+        }
+      } catch (error) {
+        console.error("Error checking 3D model:", error);
+        setHas3DModel(false);
+        setModel3DUrl(null);
+      }
+    };
+
+    check3DModel();
+  }, [productId]);
+
+  // Update isInitialGeneration in the store only once on mount
+  useEffect(() => {
+    if (!isInitialGenerationSetRef.current) {
+      setIsInitialGeneration(actualIsInitialGeneration);
+      isInitialGenerationSetRef.current = true;
+    }
+  }, [actualIsInitialGeneration, setIsInitialGeneration]);
+
+  // Track selected revision and update when active changes
+  useEffect(() => {
+    const activeRevision = revisions.find((r: any) => r.isActive);
+    if (activeRevision) {
+      setSelectedRevision(activeRevision);
+    }
+  }, [revisions]);
+
+  // Load tech pack data for each revision
+  useEffect(() => {
+    const loadTechPacksForRevisions = async () => {
+      if (!revisions || revisions.length === 0) return;
+
+      devLog(
+        "load-tech-packs",
+        `Loading tech packs for ${revisions.length} revisions...`
+      );
+
+      const techPacksMap: Record<string, boolean> = {};
+
+      // Import the getTechPacksForProduct function to check by revision_number
+      const { getTechPacksForProduct } = await import(
+        "@/app/actions/tech-pack-management"
+      );
+
+      try {
+        // Get all tech packs for this product
+        const result = await getTechPacksForProduct(productId);
+
+        if (result.success && result.techPacks) {
+          devLog(
+            "load-tech-packs",
+            `✅ Fetched ${result.techPacks.length} tech packs`
+          );
+
+          // Create a map of revision_number to tech pack existence
+          const revisionNumberMap: Record<number, boolean> = {};
+          result.techPacks.forEach((tp: any) => {
+            if (tp.revision_number) {
+              revisionNumberMap[tp.revision_number] = true;
+            }
+          });
+
+          // Map tech packs to revision IDs (using batch_id as ID)
+          revisions.forEach((revision) => {
+            if (revision.revisionNumber) {
+              techPacksMap[revision.id] =
+                revisionNumberMap[revision.revisionNumber] || false;
+            } else {
+              techPacksMap[revision.id] = false;
+            }
+          });
+
+          devLog("load-tech-packs", { techPacksMap }, "Tech packs mapped");
+        }
+      } catch (error) {
+        console.error("Error loading tech packs for revisions:", error);
+        // Set all to false on error
+        revisions.forEach((revision) => {
+          techPacksMap[revision.id] = false;
+        });
+      }
+
+      setRevisionTechPacks(techPacksMap);
+    };
+
+    loadTechPacksForRevisions();
+  }, [revisions, productId]);
+
+  // Update current views when selected revision changes
+  useEffect(() => {
+    if (selectedRevision && selectedRevision.views) {
+      devLog(
+        "update-views",
+        { revisionId: selectedRevision.id },
+        "Updating views from revision"
+      );
+      const revisionViews = {
+        front: selectedRevision.views.front?.imageUrl || "",
+        back: selectedRevision.views.back?.imageUrl || "",
+        side: selectedRevision.views.side?.imageUrl || "",
+        top: selectedRevision.views.top?.imageUrl || "",
+        bottom: selectedRevision.views.bottom?.imageUrl || "",
+      };
+
+      // Only update if views are actually different
+      const viewsChanged = Object.keys(revisionViews).some(
+        (key) =>
+          revisionViews[key as keyof typeof revisionViews] !==
+          currentViews[key as keyof typeof currentViews]
+      );
+
+      if (viewsChanged) {
+        setCurrentViews(revisionViews);
+      }
+    }
+  }, [selectedRevision?.id]);
+
+  // Track when initial generation completes (backup check)
+  useEffect(() => {
+    if (
+      initialGenerationTriggered.current &&
+      currentViews &&
+      currentViews.front &&
+      currentViews.back &&
+      currentViews.side &&
+      currentViews.top &&
+      currentViews.bottom &&
+      // Check if all views have actual URLs (not placeholders)
+      !currentViews.front.includes("placeholder") &&
+      !currentViews.back.includes("placeholder") &&
+      !currentViews.side.includes("placeholder") &&
+      !currentViews.top.includes("placeholder") &&
+      !currentViews.bottom.includes("placeholder")
+    ) {
+      // Clear processing state (backup in case the main handler didn't)
+      if (isProcessing) {
+        devLogOnce(
+          "backup-completion",
+          "🔄 Backup completion check - clearing states"
+        );
+        setIsProcessing(false);
+        setAllLoadingViews(false);
+        setRevisionsLoading(false);
+      }
+
+      // Mark initial generation as complete
+      initialGenerationTriggered.current = false;
+    }
+  }, [currentViews, isProcessing, setIsProcessing, setAllLoadingViews]);
+
+  // Extract product name when first view is generated
+  useEffect(() => {
+    const extractName = async () => {
+      if (
+        currentViews &&
+        currentViews.front &&
+        !currentViews.front.includes("placeholder") &&
+        !extractedProductName // Only extract once
+      ) {
+        const name = await extractProductNameAction(
+          currentViews.front,
+          productId
+        );
+        devLog("extract-product-name", { name }, "Product name extracted");
+        if (name) {
+          setExtractedProductName(name);
+        }
+      }
+    };
+
+    extractName();
+  }, [currentViews?.front]);
+
+  // Sync revisions prop from parent with Zustand store
+  useEffect(() => {
+    if (initialRevisions && initialRevisions.length > 0) {
+      console.log("📥 Syncing revisions from parent:", initialRevisions.length);
+      setRevisions(initialRevisions);
+
+      // Also update current views to match the active revision
+      const activeRevision = initialRevisions.find((r: any) => r.isActive);
+      if (activeRevision && activeRevision.views) {
+        console.log(
+          "🔄 Updating views to match active revision:",
+          activeRevision.revisionNumber
+        );
+        setCurrentViews({
+          front:
+            typeof activeRevision.views.front === "string"
+              ? activeRevision.views.front
+              : activeRevision.views.front?.imageUrl || "",
+          back:
+            typeof activeRevision.views.back === "string"
+              ? activeRevision.views.back
+              : activeRevision.views.back?.imageUrl || "",
+          side:
+            typeof activeRevision.views.side === "string"
+              ? activeRevision.views.side
+              : activeRevision.views.side?.imageUrl || "",
+          top:
+            typeof activeRevision.views.top === "string"
+              ? activeRevision.views.top
+              : activeRevision.views.top?.imageUrl || "",
+          bottom:
+            typeof activeRevision.views.bottom === "string"
+              ? activeRevision.views.bottom
+              : activeRevision.views.bottom?.imageUrl || "",
+        });
+      }
+    }
+  }, [initialRevisions, setRevisions, setCurrentViews]);
+
+  // Initialize with DB as single source of truth
+  useEffect(() => {
+    if (isOpen && productId) {
+      console.log(
+        "🚀 Initializing AI Designer - Fetching from DB (source of truth)"
+      );
+
+      // Step 1: Set loading states - but don't clear views yet to prevent flash
+      setIsCheckingApproval(true);
+      setRevisionsLoading(true);
+
+      // Step 2: Clear non-visual state when productId changes
+      console.log("🧹 Clearing state for new product:", productId);
+      resetChatStore(); // Clear chat messages
+      setFrontViewVersions([]); // Clear front view versions
+      // Note: Don't clear currentViews here - let them be replaced when data loads
+      setFrontViewApproval({
+        status: "pending",
+        imageUrl: null,
+        approvalId: null,
+        iterationCount: 0,
+      }); // Reset front view approval to initial state
+      setCurrentViews({
+        front: "",
+        back: "",
+        side: "",
+        top: "",
+        bottom: "",
+      });
+      setRevisions([]);
+
+      // Step 3: Set product info only (no views/revisions from props)
+      setProductInfo(productId, productName, productDescription);
+
+      // Step 4: Load complete state from database
+      const loadProductState = async () => {
+        try {
+          // Import DB functions
+          const { getGroupedMultiViewRevisions } = await import(
+            "@/app/actions/ai-image-edit-new-table"
+          );
+          const { getPendingFrontViewApproval } = await import(
+            "@/app/actions/progressive-generation-workflow"
+          );
+
+          console.log("📊 Step 1: Checking for revisions...");
+          // Try to load revisions first (completed products)
+          const revisionsResult = await getGroupedMultiViewRevisions(productId);
+
+          if (
+            revisionsResult.success &&
+            revisionsResult.revisions?.length > 0
+          ) {
+            // ✅ HAS REVISIONS → Product complete, show multi-view editor
+            console.log(
+              `✅ Found ${revisionsResult.revisions.length} revision(s) - Product is complete`
+            );
+
+            setRevisions(revisionsResult.revisions);
+            if (onRevisionsChange) {
+              onRevisionsChange(revisionsResult.revisions);
+            }
+
+            // Load views from active revision
+            const activeRevision = revisionsResult.revisions.find(
+              (r: any) => r.isActive
+            );
+            if (activeRevision?.views) {
+              console.log("📥 Loading views from active revision");
+              setCurrentViews({
+                front: activeRevision.views.front?.imageUrl || "",
+                back: activeRevision.views.back?.imageUrl || "",
+                side: activeRevision.views.side?.imageUrl || "",
+                top: activeRevision.views.top?.imageUrl || "",
+                bottom: activeRevision.views.bottom?.imageUrl || "",
+              });
+              // Immediately clear loading states when views are loaded from DB
+              setAllLoadingViews(false);
+            }
+
+            // Set to completed multi-view state
+            setWorkflowMode("multi-view");
+            setGenerationState("completed");
+            initialGenerationTriggered.current = false;
+
+            console.log("✅ State: Multi-view editor with completed product");
+          } else {
+            // ❌ NO REVISIONS → Check for pending front view approval
+            console.log(
+              "📊 Step 2: No revisions found, checking for pending approval..."
+            );
+
+            const approvalResult = await getPendingFrontViewApproval(productId);
+
+            if (approvalResult.success && approvalResult.approval) {
+              // ✅ HAS PENDING APPROVAL → Show front view approval UI
+              console.log(
+                `✅ Found pending approval (iteration ${approvalResult.approval.iteration_number})`
+              );
+
+              setWorkflowMode("front-view");
+              setFrontViewApproval({
+                status: "pending",
+                imageUrl: approvalResult.approval.front_view_url,
+                approvalId: approvalResult.approval.id,
+                iterationCount: approvalResult.approval.iteration_number || 1,
+              });
+              setCurrentViews({
+                front: approvalResult.approval.front_view_url,
+              });
+              setGenerationState("awaiting_front_approval");
+              initialGenerationTriggered.current = false;
+
+              console.log("✅ State: Front view approval workflow");
+            } else {
+              // ❌ NO APPROVAL → Fresh product, ready for generation
+              console.log(
+                "📊 Step 3: No approval found - Fresh product ready for generation"
+              );
+
+              setWorkflowMode(null);
+              setGenerationState("idle");
+              setCurrentViews({
+                front: "",
+                back: "",
+                side: "",
+                top: "",
+                bottom: "",
+              });
+              setRevisions([]);
+              initialGenerationTriggered.current = false;
+
+              console.log("✅ State: Ready for new generation");
+            }
+          }
+        } catch (error) {
+          console.error("❌ Error loading product state from DB:", error);
+          setGenerationState("error");
+        } finally {
+          setIsCheckingApproval(false);
+          setRevisionsLoading(false);
+          console.log("✅ Initialization complete");
+        }
+      };
+
+      loadProductState();
+    }
+  }, [
+    isOpen,
+    productId,
+    productName,
+    productDescription,
+    setProductInfo,
+    setCurrentViews,
+    setRevisions,
+    setFrontViewApproval,
+    setGenerationState,
+    setWorkflowMode,
+    onRevisionsChange,
+    resetChatStore,
+  ]);
+
+  // Load views from active revision when views are empty but revisions exist
+  // This handles the case when app resumes from background
+  useEffect(() => {
+    const loadViewsFromRevision = () => {
+      // Check if we're in completed state with revisions but empty views
+      const hasRevisions = revisions.length > 0;
+      const viewsEmpty = Object.values(currentViews).every(
+        (v) => !v || v === ""
+      );
+      const isCompletedState =
+        generationState === "completed" || generationState === "idle";
+
+      // CRITICAL: Don't reload if we're in multi-view workflow mode
+      // This prevents overwriting views right after generation completes
+      if (workflowMode === "multi-view") {
+        console.log(
+          "⚠️ Skipping reload - in multi-view workflow, views should already be set"
+        );
+        return;
+      }
+
+      if (isCompletedState && hasRevisions && viewsEmpty && isOpen) {
+        devLog(
+          "reload-views-from-revision",
+          { revisionsCount: revisions.length },
+          "Views empty but revisions exist - reloading from active revision"
+        );
+
+        // Find the active revision
+        const activeRevision = revisions.find((r: any) => r.isActive);
+        if (activeRevision?.views) {
+          console.log("📥 Loading views from revision:", {
+            front: !!activeRevision.views.front,
+            back: !!activeRevision.views.back,
+            side: !!activeRevision.views.side,
+            top: !!activeRevision.views.top,
+            bottom: !!activeRevision.views.bottom,
+          });
+
+          setCurrentViews({
+            front: activeRevision.views.front?.imageUrl || "",
+            back: activeRevision.views.back?.imageUrl || "",
+            side: activeRevision.views.side?.imageUrl || "",
+            top: activeRevision.views.top?.imageUrl || "",
+            bottom: activeRevision.views.bottom?.imageUrl || "",
+          });
+          devLog(
+            "views-reloaded",
+            {
+              front: !!activeRevision.views.front,
+              back: !!activeRevision.views.back,
+              side: !!activeRevision.views.side,
+              top: !!activeRevision.views.top,
+              bottom: !!activeRevision.views.bottom,
+            },
+            "Views reloaded from active revision"
+          );
+        }
+      }
+    };
+
+    loadViewsFromRevision();
+  }, [
+    isOpen,
+    revisions,
+    currentViews,
+    generationState,
+    workflowMode,
+    setCurrentViews,
+  ]);
+
+  // Fetch front view versions when entering approval state or switching to front-view mode
+  useEffect(() => {
+    const fetchVersions = async () => {
+      // Fetch when in approval state OR when viewing front versions mode
+      const shouldFetch =
+        productId &&
+        (generationState === "awaiting_front_approval" ||
+          workflowMode === "front-view");
+
+      if (shouldFetch) {
+        try {
+          const { getAllFrontViewVersions } = await import(
+            "@/app/actions/progressive-generation-workflow"
+          );
+          const result = await getAllFrontViewVersions(productId);
+
+          if (result.success && result.versions) {
+            const formattedVersions = result.versions.map((v: any) => ({
+              id: v.id,
+              frontViewUrl: v.front_view_url,
+              iterationNumber: v.iteration_number,
+              createdAt: v.created_at,
+            }));
+            console.log("📦 Fetched front view versions:", formattedVersions);
+            setFrontViewVersions(formattedVersions);
+
+            // Auto-select the latest version (highest iteration number) if none is selected
+            if (formattedVersions.length > 0 && !frontViewApproval.approvalId) {
+              const latestVersion = formattedVersions.reduce((latest, current) =>
+                current.iterationNumber > latest.iterationNumber ? current : latest
+              );
+
+              setFrontViewApproval({
+                status: "pending",
+                imageUrl: latestVersion.frontViewUrl,
+                approvalId: latestVersion.id,
+                iterationCount: latestVersion.iterationNumber,
+              });
+
+              setCurrentViews({ front: latestVersion.frontViewUrl });
+              console.log("✅ Auto-selected latest version:", latestVersion.iterationNumber);
+            }
+
+            devLog(
+              "versions-fetched",
+              { count: formattedVersions.length },
+              "Front view versions loaded"
+            );
+          } else {
+            console.log("❌ No versions found or fetch failed:", result);
+          }
+        } catch (error) {
+          console.error("Error fetching front view versions:", error);
+        }
+      }
+    };
+
+    fetchVersions();
+  }, [productId, generationState, workflowMode]);
+
+  // CRITICAL: Complete cleanup when modal closes
+  // This prevents stale state from showing when reopening the editor
+  useEffect(() => {
+    if (!isOpen) {
+      console.log("🧹 Modal closed - performing complete cleanup");
+
+      // Clear Zustand store state
+      resetWorkflowState();
+      resetChatStore(); // Clear all chat messages and state
+      setCurrentViews({
+        front: "",
+        back: "",
+        side: "",
+        top: "",
+        bottom: "",
+      });
+      setRevisions([]);
+      setAllLoadingViews(false);
+
+      // Clear local state
+      setSelectedRevision(null);
+      setExtractedProductName(null);
+      setRevisionsLoading(false);
+      setIsGeneratingTechPack(false);
+      setTechPackGeneratedFor(null);
+      setRevisionTechPacks({});
+      setFrontViewVersions([]);
+      setIsCheckingApproval(false); // Set to false, not true!
+      setUserProducts([]);
+      setHas3DModel(false);
+      setModel3DUrl(null);
+      setShow3DViewer(false);
+
+      // Reset refs
+      initialGenerationTriggered.current = false;
+      isInitialGenerationSetRef.current = false;
+
+      console.log("✅ Complete cleanup finished");
+    }
+  }, [
+    isOpen,
+    resetWorkflowState,
+    resetChatStore,
+    setCurrentViews,
+    setRevisions,
+    setAllLoadingViews,
+  ]);
+
+  // ========== Progressive Generation Workflow Handlers ==========
+
+  /**
+   * Handle switching to a different front view version
+   */
+  const handleVersionChange = useCallback(
+    async (versionId: string) => {
+      try {
+        devLog(
+          "version-change",
+          { versionId },
+          "Switching to different front view version"
+        );
+
+        // Find the selected version
+        const selectedVersion = frontViewVersions.find(
+          (v) => v.id === versionId
+        );
+        if (!selectedVersion) {
+          console.error("Version not found:", versionId);
+          return;
+        }
+
+        // Update the front view approval state with the selected version
+        setFrontViewApproval({
+          status: "pending",
+          imageUrl: selectedVersion.frontViewUrl,
+          approvalId: versionId,
+          iterationCount: selectedVersion.iterationNumber,
+        });
+
+        // Update current views with the selected front view
+        setCurrentViews({ front: selectedVersion.frontViewUrl });
+
+        devLog(
+          "version-changed",
+          { iterationNumber: selectedVersion.iterationNumber },
+          "Switched to front view version"
+        );
+      } catch (error) {
+        console.error("Error changing version:", error);
+      }
+    },
+    [frontViewVersions, setFrontViewApproval, setCurrentViews]
+  );
+
+  /**
+   * Handle front view approval
+   * When user approves the front view, proceed to generate remaining views
+   */
+  const handleApproveFrontView = useCallback(async () => {
+    if (!frontViewApproval.approvalId) {
+      console.error("No approval ID available");
+      return;
+    }
+
+    try {
+      devLog(
+        "approve-front-view",
+        { approvalId: frontViewApproval.approvalId },
+        "Approving front view"
+      );
+
+      // Switch to multi-view workflow mode
+      setWorkflowMode("multi-view");
+
+      // IMMEDIATELY transition to generating additional views state
+      // This ensures smooth UI transition without intermediate states
+      setGenerationState("generating_additional_views");
+
+      // IMPORTANT: Set the front view in currentViews first
+      setCurrentViews({ front: frontViewApproval.imageUrl! });
+      setLoadingView("front", false);
+
+      // Set loading states for remaining views
+      setLoadingView("back", true);
+      setLoadingView("side", true);
+      setLoadingView("top", true);
+      setLoadingView("bottom", true);
+
+      // Call server action to handle approval
+      const result = await handleFrontViewDecision({
+        approvalId: frontViewApproval.approvalId,
+        action: "approve",
+      });
+
+      if (!result.success) {
+        throw new Error(result.error || "Failed to approve front view");
+      }
+
+      devLog(
+        "front-view-approved",
+        { extractedFeatures: result.extractedFeatures },
+        "Front view approved"
+      );
+
+      // Save AI message about proceeding to generate remaining views
+      await sendMessage(
+        "Great! I'll now generate the back, side, top, and bottom views based on your approved front design. This will take about 2 minutes.",
+        "ai"
+      );
+
+      // Transition to generating additional views state
+      setGenerationState("generating_additional_views");
+
+      // IMPORTANT: Set the front view in currentViews first
+      setCurrentViews({ front: frontViewApproval.imageUrl! });
+      setLoadingView("front", false);
+
+      // Set loading states for remaining views
+      setLoadingView("back", true);
+      setLoadingView("side", true);
+      setLoadingView("top", true);
+      setLoadingView("bottom", true);
+      // Update view progress
+      updateViewProgress("front", "completed");
+      updateViewProgress("back", "generating");
+      updateViewProgress("side", "pending");
+      updateViewProgress("top", "pending");
+      updateViewProgress("bottom", "pending");
+
+      // Generate remaining views
+      const viewsResult = await generateRemainingViews({
+        approvalId: frontViewApproval.approvalId,
+        frontViewUrl: frontViewApproval.imageUrl!,
+      });
+
+      if (!viewsResult.success || !viewsResult.views) {
+        throw new Error(
+          viewsResult.error || "Failed to generate remaining views"
+        );
+      }
+
+      devLog(
+        "remaining-views-generated",
+        { views: Object.keys(viewsResult.views) },
+        "Remaining views generated"
+      );
+
+      // Update current views progressively as they complete
+      const { back, side, top, bottom } = viewsResult.views;
+
+      // Back view
+      if (back) {
+        setCurrentViews({ back });
+        setLoadingView("back", false);
+        updateViewProgress("back", "completed");
+        updateViewProgress("side", "generating");
+      }
+
+      // Side view
+      if (side) {
+        setCurrentViews({ side });
+        setLoadingView("side", false);
+        updateViewProgress("side", "completed");
+        updateViewProgress("top", "generating");
+      }
+
+      // Top view
+      if (top) {
+        setCurrentViews({ top });
+        setLoadingView("top", false);
+        updateViewProgress("top", "completed");
+        updateViewProgress("bottom", "generating");
+      }
+
+      // Bottom view
+      if (bottom) {
+        setCurrentViews({ bottom });
+        setLoadingView("bottom", false);
+        updateViewProgress("bottom", "completed");
+      }
+
+      // Create revision after all views are generated
+      setGenerationState("creating_revision");
+
+      // Log all views before creating revision
+      console.log("📝 Creating revision with all 5 views:", {
+        front: !!frontViewApproval.imageUrl,
+        back: !!back,
+        side: !!side,
+        top: !!top,
+        bottom: !!bottom,
+        frontUrl: frontViewApproval.imageUrl?.substring(0, 50),
+        backUrl: back?.substring(0, 50),
+        sideUrl: side?.substring(0, 50),
+        topUrl: top?.substring(0, 50),
+        bottomUrl: bottom?.substring(0, 50),
+      });
+
+      const revisionResult = await createRevisionAfterApproval({
+        productId,
+        approvalId: frontViewApproval.approvalId,
+        allViews: {
+          front: frontViewApproval.imageUrl!,
+          back,
+          side,
+          top,
+          bottom,
+        },
+        isInitial: actualIsInitialGeneration,
+      });
+
+      if (!revisionResult.success) {
+        throw new Error(revisionResult.error || "Failed to create revision");
+      }
+
+      console.log("✅ Revision created successfully:", {
+        revisionNumber: revisionResult.revisionNumber,
+        revisionIds: revisionResult.revisionIds,
+      });
+
+      devLog(
+        "revision-created",
+        { revisionNumber: revisionResult.revisionNumber },
+        "Revision created"
+      );
+
+      // Mark as completed and ensure all views are set
+      setCurrentViews({
+        front: frontViewApproval.imageUrl!,
+        back,
+        side,
+        top,
+        bottom,
+      });
+
+      // Clear all loading states
+      setLoadingView("front", false);
+      setLoadingView("back", false);
+      setLoadingView("side", false);
+      setLoadingView("top", false);
+      setLoadingView("bottom", false);
+
+      setGenerationState("completed");
+      setIsProcessing(false);
+
+      // Refresh credits
+      if (refreshUserCredits) {
+        await refreshUserCredits();
+      }
+
+      // Save success message
+      await sendMessage("All views generated successfully!", "success");
+
+      // Load revisions
+      setTimeout(async () => {
+        setRevisionsLoading(true);
+        try {
+          const { getGroupedMultiViewRevisions } = await import(
+            "@/app/actions/ai-image-edit-new-table"
+          );
+          const revisionsResult = await getGroupedMultiViewRevisions(productId);
+          if (revisionsResult.success && revisionsResult.revisions) {
+            setRevisions(revisionsResult.revisions);
+            if (onRevisionsChange) {
+              onRevisionsChange(revisionsResult.revisions);
+            }
+          }
+        } catch (error) {
+          console.error("Error loading revisions:", error);
+        } finally {
+          setRevisionsLoading(false);
+        }
+      }, 2000);
+    } catch (error) {
+      console.error("Error approving front view:", error);
+      setGenerationState("error");
+      setIsProcessing(false);
+      setAllLoadingViews(false);
+      await sendMessage(
+        `Failed to generate remaining views: ${error instanceof Error ? error.message : "Unknown error"}`,
+        "error"
+      );
+    }
+  }, [
+    frontViewApproval.approvalId,
+    frontViewApproval.imageUrl,
+    productId,
+    actualIsInitialGeneration,
+    sendMessage,
+    setGenerationState,
+    setLoadingView,
+    updateViewProgress,
+    setCurrentViews,
+    setIsProcessing,
+    refreshUserCredits,
+    setRevisions,
+    onRevisionsChange,
+    setAllLoadingViews,
+  ]);
+
+  /**
+   * Handle front view edit request
+   * When user requests changes to the front view, regenerate it with feedback
+   */
+  const handleRequestFrontViewEdit = useCallback(
+    async (feedback: string) => {
+      try {
+        devLog(
+          "request-front-edit",
+          { feedback },
+          "Requesting front view edit"
+        );
+
+        // Update state to show we're processing the edit
+        setIsProcessing(true);
+
+        // If no approval ID, this is a new edit request on completed product
+        // Start a new progressive workflow
+        if (!frontViewApproval.approvalId) {
+          devLog(
+            "start-new-progressive-workflow",
+            { fromCompleted: true },
+            "Starting new progressive workflow from completed state"
+          );
+
+          setGenerationState("generating_front_view");
+
+          // Generate front view with edit prompt
+          const frontResult = await generateFrontViewOnly({
+            productId: productId!,
+            userPrompt: feedback,
+            isEdit: true,
+            previousFrontViewUrl: currentViews.front || "",
+          });
+
+          if (
+            !frontResult.success ||
+            !frontResult.frontViewUrl ||
+            !frontResult.approvalId
+          ) {
+            throw new Error(
+              frontResult.error || "Failed to generate front view"
+            );
+          }
+
+          // Update store with new approval data
+          setFrontViewApproval({
+            status: "pending",
+            imageUrl: frontResult.frontViewUrl,
+            approvalId: frontResult.approvalId,
+            iterationCount: 1,
+          });
+
+          setCurrentViews({ front: frontResult.frontViewUrl });
+          setGenerationState("awaiting_front_approval");
+          setWorkflowMode("front-view");
+
+          // Clear processing state
+          setIsProcessing(false);
+
+          return;
+        }
+
+        // Otherwise, continue with existing approval workflow
+        // Call server action to handle edit decision
+        const result = await handleFrontViewDecision({
+          approvalId: frontViewApproval.approvalId,
+          action: "edit",
+          editFeedback: feedback,
+        });
+
+        if (!result.success) {
+          throw new Error(result.error || "Failed to request edit");
+        }
+
+        if (
+          result.action !== "regenerate" ||
+          !result.newFrontViewUrl ||
+          !result.newApprovalId
+        ) {
+          throw new Error("Invalid edit response from server");
+        }
+
+        devLog(
+          "front-view-regenerated",
+          { newApprovalId: result.newApprovalId },
+          "Front view regenerated"
+        );
+
+        // Update front view approval with new data
+        setFrontViewApproval({
+          imageUrl: result.newFrontViewUrl,
+          approvalId: result.newApprovalId,
+          status: "pending",
+          iterationCount: frontViewApproval.iterationCount + 1,
+        });
+
+        // Update current views with new front view
+        setCurrentViews({ front: result.newFrontViewUrl });
+
+        // Refetch versions to include the new version
+        if (productId) {
+          try {
+            const { getAllFrontViewVersions } = await import(
+              "@/app/actions/progressive-generation-workflow"
+            );
+            const versionsResult = await getAllFrontViewVersions(productId);
+            if (versionsResult.success && versionsResult.versions) {
+              const formattedVersions = versionsResult.versions.map(
+                (v: any) => ({
+                  id: v.id,
+                  frontViewUrl: v.front_view_url,
+                  iterationNumber: v.iteration_number,
+                  createdAt: v.created_at,
+                })
+              );
+              setFrontViewVersions(formattedVersions);
+              devLog(
+                "versions-refetched",
+                { count: formattedVersions.length },
+                "Versions updated after edit"
+              );
+            }
+          } catch (versionError) {
+            console.error("Error refetching versions:", versionError);
+          }
+        }
+
+        // Save message about regeneration
+        await sendMessage(
+          `I've regenerated the front view based on your feedback: "${feedback}". Please review the updated design.`,
+          "ai"
+        );
+
+        setIsProcessing(false);
+      } catch (error) {
+        console.error("Error requesting front view edit:", error);
+        setIsProcessing(false);
+        await sendMessage(
+          `Failed to regenerate front view: ${error instanceof Error ? error.message : "Unknown error"}`,
+          "error"
+        );
+      }
+    },
+    [
+      frontViewApproval.approvalId,
+      frontViewApproval.iterationCount,
+      sendMessage,
+      setIsProcessing,
+      setFrontViewApproval,
+      setCurrentViews,
+    ]
+  );
+
+  /**
+   * Handle skip - return to normal editor state
+   * Exits the approval workflow without generating remaining views
+   */
+  const handleSkipApproval = useCallback(() => {
+    // Reset generation state to idle/completed
+    setGenerationState("idle");
+    setWorkflowMode("multi-view");
+
+    // Keep the front view in currentViews but clear approval data
+    setFrontViewApproval({
+      status: "pending",
+      imageUrl: null,
+      approvalId: null,
+      iterationCount: 0,
+    });
+
+    devLog("skip-approval", {}, "User skipped approval, returned to editor");
+  }, [setGenerationState, setWorkflowMode, setFrontViewApproval]);
+
+  /**
+   * Handle initial product generation with progressive workflow
+   * Generates only the front view first, then waits for user approval
+   */
+  const handleGenerateProduct = useCallback(
+    async (userPrompt: string) => {
+      try {
+        // CRITICAL: Check if generation is already in progress using ref
+        if (generationInProgress.current) {
+          console.warn(
+            "[handleGenerateProduct] ❌ Generation already in progress, ignoring duplicate call"
+          );
+          return;
+        }
+
+        // Set the flag IMMEDIATELY to block any other calls
+        generationInProgress.current = true;
+        console.log("[handleGenerateProduct] 🔒 Generation locked");
+
+        devLog(
+          "generate-product-progressive",
+          { productId },
+          "Starting progressive generation"
+        );
+
+        // Reset workflow state
+        resetWorkflowState();
+
+        // Set workflow mode to front-view (progressive workflow)
+        setWorkflowMode("front-view");
+
+        // Set state to generating front view
+        setGenerationState("generating_front_view");
+        setIsProcessing(true);
+
+        // Save user message
+        await sendMessage(userPrompt, "user");
+
+        // Add processing message
+        await sendMessage(
+          "Generating your product's front view first. This will take about 30 seconds...",
+          "processing"
+        );
+
+        // Generate only the front view
+        const result = await generateFrontViewOnly({
+          productId,
+          userPrompt,
+          isEdit: false,
+        });
+
+        if (!result.success || !result.frontViewUrl || !result.approvalId) {
+          throw new Error(result.error || "Failed to generate front view");
+        }
+
+        devLog(
+          "front-view-generated",
+          {
+            approvalId: result.approvalId,
+            frontViewUrl: result.frontViewUrl,
+          },
+          "Front view generated"
+        );
+
+        console.log("🖼️ Setting front view approval state:", {
+          imageUrl: result.frontViewUrl,
+          approvalId: result.approvalId,
+          status: "pending",
+          iterationCount: 1,
+        });
+
+        // Update state with front view approval data
+        setFrontViewApproval({
+          imageUrl: result.frontViewUrl,
+          approvalId: result.approvalId,
+          status: "pending",
+          iterationCount: 1,
+        });
+
+        // Update current views with front view
+        setCurrentViews({ front: result.frontViewUrl });
+
+        console.log("🎯 Transitioning to awaiting_front_approval state");
+
+        // Transition to awaiting approval state
+        setGenerationState("awaiting_front_approval");
+        setIsProcessing(false);
+
+        // Save message about front view ready
+        await sendMessage(
+          "I've generated the front view of your product. Take a look and let me know if you'd like any changes before I create the remaining views!",
+          "ai"
+        );
+      } catch (error) {
+        console.error("Error generating product:", error);
+        setGenerationState("error");
+        setIsProcessing(false);
+        await sendMessage(
+          `Failed to generate front view: ${error instanceof Error ? error.message : "Unknown error"}`,
+          "error"
+        );
+      } finally {
+        // CRITICAL: Always unlock the generation flag
+        generationInProgress.current = false;
+        console.log("[handleGenerateProduct] 🔓 Generation unlocked");
+      }
+    },
+    [
+      productId,
+      sendMessage,
+      resetWorkflowState,
+      setGenerationState,
+      setIsProcessing,
+      setFrontViewApproval,
+      setCurrentViews,
+    ]
+  );
+
+  // Dedicated useEffect for initial generation - runs only once when conditions are met
+  useEffect(() => {
+    // Only trigger if:
+    // 1. Modal is open
+    // 2. This is initial generation
+    // 3. We have a prompt
+    // 4. Not already triggered
+    // 5. Revisions finished loading
+    if (
+      !isOpen ||
+      !actualIsInitialGeneration ||
+      !initialPrompt ||
+      initialGenerationTriggered.current ||
+      revisionsLoading
+    ) {
+      return;
+    }
+
+    // Lock immediately to prevent any duplicate execution
+    initialGenerationTriggered.current = true;
+
+    console.log("🚀 [Dedicated useEffect] Triggering initial generation", {
+      productId,
+      promptLength: initialPrompt.length,
+    });
+
+    // Trigger generation directly without setTimeout
+    handleGenerateProduct(initialPrompt);
+
+    // No cleanup needed - we want this to run once and only once
+  }, [
+    isOpen,
+    actualIsInitialGeneration,
+    initialPrompt,
+    productId,
+    revisionsLoading,
+  ]);
+  // Note: handleGenerateProduct intentionally omitted - it's stable from useCallback
+
+  // Handle tech pack generation
+  const handleGenerateTechPack = async () => {
+    if (onGenerateTechPack) {
+      setIsGeneratingTechPack(true);
+      try {
+        // Always use the active revision for tech pack generation
+        const activeRevision = revisions.find((r) => r.isActive);
+        const revisionToUse = activeRevision || revisions[0];
+
+        devLog(
+          "tech-pack-generation",
+          {
+            revisionId: revisionToUse?.id,
+            revisionNumber: revisionToUse?.revisionNumber,
+            totalRevisions: revisions.length,
+          },
+          "Tech pack generation started"
+        );
+
+        await onGenerateTechPack(revisionToUse);
+        devLog(
+          "tech-pack-complete",
+          { revisionId: revisionToUse?.id },
+          "Tech pack generation completed"
+        );
+
+        await sendTechPackCreation({
+          email: user?.email,
+          creatorName: user?.full_name,
+          productName: productName,
+          techPackLink: `/creator-dashboard/techpacks/${productId}`,
+        });
+
+        // Mark tech pack as generated for this revision
+        if (revisionToUse?.id) {
+          setTechPackGeneratedFor(revisionToUse.id);
+          devLog(
+            "tech-pack-marked",
+            { revisionId: revisionToUse.id },
+            "Tech pack marked as generated"
+          );
+        }
+      } catch (error) {
+        console.error("❌ Tech pack generation failed:", error);
+      } finally {
+        setIsGeneratingTechPack(false);
+      }
+    }
+  };
+
+  // Memoize callbacks to prevent RevisionHistory from re-rendering
+  const handleRevisionRollback = useCallback(
+    (revision: any) => {
+      setSelectedRevision(revision);
+      if (onRollback) onRollback(revision);
+    },
+    [onRollback]
+  );
+
+  const handleRevisionDelete = useCallback(
+    async (id: string) => {
+      return onDeleteRevision?.(id) || false;
+    },
+    [onDeleteRevision]
+  );
+
+  // For initial generation or when not open, return null
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-gradient-to-br from-gray-50 to-gray-100">
+      <ErrorBoundary>
+        {/* Full-screen loading overlay - covers entire AI Designer */}
+        <LoadingOverlay
+          show={isCheckingApproval || revisionsLoading || isCleaningSession}
+          isCleaningSession={isCleaningSession}
+          hasExistingViews={!!(
+            currentViews.front ||
+            currentViews.back ||
+            currentViews.side ||
+            currentViews.top ||
+            currentViews.bottom
+          )}
+        />
+
+        <div className="h-full flex flex-col">
+          {/* Header */}
+          <EditorHeader
+            productId={productId}
+            productName={productName}
+            extractedProductName={extractedProductName}
+            userProducts={userProducts}
+            isProductDropdownOpen={isProductDropdownOpen}
+            setIsProductDropdownOpen={setIsProductDropdownOpen}
+            has3DModel={has3DModel}
+            model3DUrl={model3DUrl}
+            onShow3DViewer={() => setShow3DViewer(true)}
+            workflowMode={workflowMode}
+            setWorkflowMode={setWorkflowMode}
+            generationState={generationState}
+            isInitialGeneration={isInitialGeneration}
+            credits={credits?.credits || 0}
+            isMobileMenuOpen={isMobileMenuOpen}
+            setIsMobileMenuOpen={setIsMobileMenuOpen}
+            onShowTutorial={() => setShowTutorialModal(true)}
+            onShowIdeas={() => setShowIndicatorModal(true)}
+            onClose={onClose}
+            setIsCleaningSession={setIsCleaningSession}
+          />
+
+          {/* Generation Progress Indicator - Hidden for now */}
+          <GenerationProgressIndicator
+            isVisible={false}
+            onComplete={() => {
+              devLog(
+                "progress-animation-complete",
+                "Progress animation completed"
+              );
+            }}
+          />
+
+          {/* Main content */}
+          <div className="flex flex-1 overflow-hidden">
+            {/* Left sidebar - Chat (desktop) */}
+            <div
+              className={cn(
+                "w-96 border-r bg-white transition-all duration-300",
+                "hidden lg:block"
+              )}
+            >
+              <ChatInterface
+                productId={productId}
+                onEditViews={onProgressiveEdit || (onEditViews as any)}
+                selectedRevision={selectedRevision}
+                onRevisionSuccess={handleRevisionSuccess}
+                disabled={
+                  generationState === "awaiting_front_approval" ||
+                  generationState === "generating_front_view" ||
+                  generationState === "generating_additional_views"
+                }
+                disabledMessage="Please approve or edit the front view first"
+                placeholderOverride={
+                  workflowMode === "front-view"
+                    ? "Edits will be based on selected revision..."
+                    : undefined
+                }
+              />
+            </div>
+
+            {/* Main content area */}
+            <div className="flex-1 flex flex-col relative overflow-hidden">
+              {/* Desktop Views display - State-based rendering for progressive workflow */}
+              <div className="hidden sm:flex flex-1 overflow-hidden">
+                {/* Loading State: Generating Front View */}
+                {generationState === "generating_front_view" && (
+                  <CreativeLoadingAnimation
+                    title="Generating Front View"
+                    subtitle="This will take about 30 seconds..."
+                  />
+                )}
+
+                {/* Approval State: Front View Ready for Approval */}
+                {generationState === "awaiting_front_approval" &&
+                  frontViewApproval.imageUrl && (
+                    <div className="flex-1 overflow-y-auto">
+                      <FrontViewApproval
+                        frontViewUrl={frontViewApproval.imageUrl}
+                        approvalId={frontViewApproval.approvalId || ""}
+                        iterationCount={frontViewApproval.iterationCount}
+                        onApprove={handleApproveFrontView}
+                        onRequestEdit={handleRequestFrontViewEdit}
+                        productName={extractedProductName || productName}
+                        isProcessing={isProcessing}
+                        creditsForRemaining={2}
+                        allVersions={frontViewVersions}
+                        onVersionChange={handleVersionChange}
+                        onSkip={handleSkipApproval}
+                        hasExistingRevisions={revisions.length > 0}
+                      />
+                    </div>
+                  )}
+
+                {/* Generating State: Generating Additional Views */}
+                {generationState === "generating_additional_views" && (
+                  <div className="flex-1 overflow-y-auto p-6">
+                    <ProgressiveViewsGeneration
+                      frontViewUrl={frontViewApproval.imageUrl || ""}
+                      currentViews={currentViews}
+                      loadingViews={loadingViews}
+                    />
+                  </div>
+                )}
+
+                {/* Completed/Idle State: Show either All Views or Front Versions based on workflowMode */}
+                {(generationState === "completed" ||
+                  (generationState === "idle" && !actualIsInitialGeneration) ||
+                  generationState === "creating_revision") && (
+                  <>
+                    {workflowMode === "multi-view" ? (
+                      <ViewsDisplay
+                        ref={viewsDisplayRef}
+                        onViewClick={(view) =>
+                          devLog("view-click", { view }, "View clicked")
+                        }
+                        sendUserMessage={sendUserMessage}
+                        onEditViews={onProgressiveEdit || (onEditViews as any)}
+                      />
+                    ) : (
+                      <div className="flex-1 overflow-y-auto">
+                        <FrontViewApproval
+                          frontViewUrl={
+                            frontViewApproval.imageUrl ||
+                            currentViews.front ||
+                            ""
+                          }
+                          approvalId={frontViewApproval.approvalId || ""}
+                          iterationCount={frontViewApproval.iterationCount}
+                          onApprove={handleApproveFrontView}
+                          onRequestEdit={handleRequestFrontViewEdit}
+                          productName={extractedProductName || productName}
+                          isProcessing={isProcessing}
+                          creditsForRemaining={
+                            frontViewApproval.approvalId ? 2 : 0
+                          }
+                          allVersions={frontViewVersions}
+                          onVersionChange={handleVersionChange}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {/* Initial state: waiting for user to start generation */}
+                {generationState === "idle" && actualIsInitialGeneration && (
+                  <div className="flex-1 flex items-center justify-center bg-gradient-to-br from-gray-50 to-gray-100">
+                    <div className="text-center space-y-6 px-4 max-w-md">
+                      <div className="flex items-center justify-center">
+                        <div className="relative">
+                          {/* Animated rings */}
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <div className="h-16 w-16 rounded-full border-2 border-navy/20 animate-pulse"></div>
+                          </div>
+                          <div className="absolute inset-0 flex items-center justify-center">
+                            <div className="h-12 w-12 rounded-full border-t-2 border-navy animate-spin"></div>
+                          </div>
+                          {/* Center dot */}
+                          <div className="relative flex items-center justify-center h-16 w-16">
+                            <div className="h-2 w-2 rounded-full bg-navy animate-pulse"></div>
+                          </div>
+                        </div>
+                      </div>
+                      <div>
+                        <h3 className="text-lg font-semibold text-gray-900">
+                          Ready to Create Your Product
+                        </h3>
+                        <p className="text-sm text-gray-600 mt-2">
+                          Please wait a moment...
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Error State */}
+                {generationState === "error" && (
+                  <div className="flex-1 flex items-center justify-center bg-gradient-to-br from-red-50 to-orange-50">
+                    <div className="text-center space-y-4 px-4">
+                      <div className="flex items-center justify-center">
+                        <X className="h-12 w-12 text-red-600" />
+                      </div>
+                      <div>
+                        <h3 className="text-lg font-semibold text-red-900">
+                          Generation Failed
+                        </h3>
+                        <p className="text-sm text-red-700 mt-1">
+                          An error occurred during generation. Please try again.
+                        </p>
+                      </div>
+                      <Button
+                        onClick={() => {
+                          resetWorkflowState();
+                          setGenerationState("idle");
+                        }}
+                        variant="outline"
+                        className="mt-4"
+                      >
+                        Reset
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Mobile Tabs - Takes full height on mobile */}
+              <div className="sm:hidden flex-1 flex flex-col overflow-hidden relative">
+                <Tabs
+                  value={mobileActiveTab}
+                  onValueChange={setMobileActiveTab}
+                  className="w-full flex flex-col h-full relative"
+                >
+                  <TabsList className="grid w-full grid-cols-3 flex-shrink-0 border-t rounded-none">
+                    <TabsTrigger value="chat" className="gap-2">
+                      <MessageSquare className="h-4 w-4" />
+                      Chat
+                    </TabsTrigger>
+                    <TabsTrigger value="views" className="gap-2">
+                      <Wand2 className="h-4 w-4" />
+                      Design
+                    </TabsTrigger>
+                    <TabsTrigger value="history" className="gap-2">
+                      <History className="h-4 w-4" />
+                      Revisions
+                    </TabsTrigger>
+                  </TabsList>
+
+                  {/* Mobile Workflow Mode Switcher - Show when completed - MOVED OUTSIDE TabsContent */}
+                  {mobileActiveTab === "views" &&
+                    (generationState === "completed" ||
+                      (generationState === "idle" &&
+                        !actualIsInitialGeneration)) && (
+                      <div
+                        className="flex-shrink-0 p-3 border-b border-gray-200 bg-white relative shadow-sm"
+                      >
+                        <div className="flex items-center justify-center bg-gray-100 rounded-lg p-0.5">
+                          <button
+                            onClick={() => setWorkflowMode("multi-view")}
+                            className={cn(
+                              "flex-1 px-3 py-2 text-xs font-medium rounded-md transition-colors",
+                              workflowMode === "multi-view"
+                                ? "bg-white text-gray-900 shadow-sm"
+                                : "text-gray-600"
+                            )}
+                          >
+                            All Views
+                          </button>
+                          <button
+                            onClick={() => setWorkflowMode("front-view")}
+                            className={cn(
+                              "flex-1 px-3 py-2 text-xs font-medium rounded-md transition-colors",
+                              workflowMode === "front-view"
+                                ? "bg-white text-gray-900 shadow-sm"
+                                : "text-gray-600"
+                            )}
+                          >
+                            Front Versions
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                  <TabsContent
+                    value="views"
+                    className="mt-0 flex-1 min-h-0 overflow-y-auto relative"
+                    style={{ zIndex: 1 }}
+                  >
+                    {/* Mobile: State-based rendering for progressive workflow */}
+                    {generationState === "generating_front_view" && (
+                      <CreativeLoadingAnimation
+                        title="Generating Front View"
+                        subtitle="~30 seconds..."
+                      />
+                    )}
+
+                    {generationState === "awaiting_front_approval" &&
+                      frontViewApproval.imageUrl && (
+                        <div className="w-full">
+                          <FrontViewApproval
+                            frontViewUrl={frontViewApproval.imageUrl}
+                            approvalId={frontViewApproval.approvalId || ""}
+                            iterationCount={frontViewApproval.iterationCount}
+                            onApprove={handleApproveFrontView}
+                            onRequestEdit={handleRequestFrontViewEdit}
+                            productName={extractedProductName || productName}
+                            isProcessing={isProcessing}
+                            creditsForRemaining={2}
+                            allVersions={frontViewVersions}
+                            onVersionChange={handleVersionChange}
+                            onSkip={handleSkipApproval}
+                            hasExistingRevisions={revisions.length > 0}
+                          />
+                        </div>
+                      )}
+
+                    {generationState === "generating_additional_views" && (
+                      <div className="flex-1 overflow-y-auto p-4">
+                        <ProgressiveViewsGeneration
+                          frontViewUrl={frontViewApproval.imageUrl || ""}
+                          currentViews={currentViews}
+                          loadingViews={loadingViews}
+                        />
+                      </div>
+                    )}
+
+                    {(generationState === "completed" ||
+                      (generationState === "idle" &&
+                        !actualIsInitialGeneration) ||
+                      generationState === "creating_revision") && (
+                      <>
+                        {workflowMode === "multi-view" ? (
+                          <ViewsDisplay
+                            ref={viewsDisplayRef}
+                            onViewClick={(view) =>
+                              devLog(
+                                "view-click-mobile",
+                                { view },
+                                "View clicked (mobile)"
+                              )
+                            }
+                            sendUserMessage={sendUserMessage}
+                            onEditViews={
+                              onProgressiveEdit || (onEditViews as any)
+                            }
+                          />
+                        ) : (
+                          <div className="w-full">
+                            <FrontViewApproval
+                              frontViewUrl={
+                                frontViewApproval.imageUrl ||
+                                currentViews.front ||
+                                ""
+                              }
+                              approvalId={frontViewApproval.approvalId || ""}
+                              iterationCount={frontViewApproval.iterationCount}
+                              onApprove={handleApproveFrontView}
+                              onRequestEdit={handleRequestFrontViewEdit}
+                              productName={extractedProductName || productName}
+                              isProcessing={isProcessing}
+                              creditsForRemaining={
+                                frontViewApproval.approvalId ? 2 : 0
+                              }
+                              allVersions={frontViewVersions}
+                              onVersionChange={handleVersionChange}
+                            />
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {/* Initial state: waiting for user to start generation */}
+                    {generationState === "idle" &&
+                      actualIsInitialGeneration && (
+                        <div className="flex-1 flex items-center justify-center bg-gradient-to-br from-gray-50 to-gray-100 p-4">
+                          <div className="text-center space-y-6 max-w-md">
+                            <div className="flex items-center justify-center">
+                              <div className="relative">
+                                {/* Animated rings */}
+                                <div className="absolute inset-0 flex items-center justify-center">
+                                  <div className="h-16 w-16 rounded-full border-2 border-navy/20 animate-pulse"></div>
+                                </div>
+                                <div className="absolute inset-0 flex items-center justify-center">
+                                  <div className="h-12 w-12 rounded-full border-t-2 border-navy animate-spin"></div>
+                                </div>
+                                {/* Center dot */}
+                                <div className="relative flex items-center justify-center h-16 w-16">
+                                  <div className="h-2 w-2 rounded-full bg-navy animate-pulse"></div>
+                                </div>
+                              </div>
+                            </div>
+                            <div>
+                              <h3 className="text-base font-semibold text-gray-900">
+                                Ready to Create Your Product
+                              </h3>
+                              <p className="text-xs text-gray-600 mt-2">
+                                Please wait a moment...
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                    {generationState === "error" && (
+                      <div className="flex-1 flex items-center justify-center bg-gradient-to-br from-red-50 to-orange-50 p-4">
+                        <div className="text-center space-y-4">
+                          <X className="h-10 w-10 text-red-600 mx-auto" />
+                          <div>
+                            <h3 className="text-base font-semibold text-red-900">
+                              Generation Failed
+                            </h3>
+                            <p className="text-xs text-red-700 mt-1">
+                              Please try again
+                            </p>
+                          </div>
+                          <Button
+                            onClick={() => {
+                              resetWorkflowState();
+                              setGenerationState("idle");
+                            }}
+                            variant="outline"
+                            size="sm"
+                          >
+                            Reset
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                  </TabsContent>
+
+                  <TabsContent
+                    value="chat"
+                    className="mt-0 flex-1 min-h-0 bg-white relative z-10 overflow-hidden"
+                  >
+                    <ChatInterface
+                      productId={productId}
+                      onEditViews={onProgressiveEdit || (onEditViews as any)}
+                      selectedRevision={selectedRevision}
+                      onRevisionSuccess={handleRevisionSuccess}
+                      disabled={
+                        generationState === "awaiting_front_approval" ||
+                        generationState === "generating_front_view" ||
+                        generationState === "generating_additional_views"
+                      }
+                      disabledMessage="Please approve or edit the front view first"
+                      placeholderOverride={
+                        workflowMode === "front-view"
+                          ? "Edits will be based on selected revision..."
+                          : undefined
+                      }
+                    />
+                  </TabsContent>
+
+                  <TabsContent
+                    value="history"
+                    className="mt-0 flex-1 min-h-0 overflow-hidden"
+                  >
+                    <RevisionHistory
+                      revisions={revisions}
+                      onRollback={handleRevisionRollback}
+                      onDelete={handleRevisionDelete}
+                      isLoading={revisionsLoading}
+                      onGenerateTechPack={
+                        onGenerateTechPack ? handleGenerateTechPack : undefined
+                      }
+                      isGeneratingTechPack={isGeneratingTechPack}
+                      selectedRevision={selectedRevision}
+                      techPackGeneratedFor={techPackGeneratedFor}
+                      revisionTechPacks={revisionTechPacks}
+                      productId={productId}
+                    />
+                  </TabsContent>
+                </Tabs>
+              </div>
+
+              {/* Bottom Controls Bar - Always visible on desktop, hidden on mobile when not on views tab */}
+              <BottomControlsBar
+                isVisualEditMode={isVisualEditMode}
+                isSystemBusy={isSystemBusy}
+                generationState={generationState}
+                workflowMode={workflowMode}
+                loadingViews={loadingViews}
+                viewport={viewport}
+                mobileActiveTab={mobileActiveTab}
+                onToggleVisualEdit={() => setVisualEditMode(!isVisualEditMode)}
+                onZoomIn={() =>
+                  setViewport({
+                    zoomLevel: Math.min(200, viewport.zoomLevel + 10),
+                  })
+                }
+                onZoomOut={() =>
+                  setViewport({
+                    zoomLevel: Math.max(50, viewport.zoomLevel - 10),
+                  })
+                }
+                onNext={() => setMobileActiveTab("history")}
+              />
+            </div>
+
+            {/* Right sidebar - History (desktop) with smooth animation */}
+            <div
+              className={cn(
+                "border-l bg-gray-50 overflow-hidden flex",
+                "hidden sm:block",
+                "transition-all duration-300 ease-in-out",
+                showHistory ? "w-80 opacity-100" : "w-0 opacity-0 border-l-0"
+              )}
+            >
+              <div className="w-80 h-full flex flex-col overflow-hidden">
+                <RevisionHistory
+                  revisions={revisions}
+                  onRollback={handleRevisionRollback}
+                  onDelete={handleRevisionDelete}
+                  onToggle={toggleHistory}
+                  isLoading={revisionsLoading}
+                  onGenerateTechPack={
+                    onGenerateTechPack ? handleGenerateTechPack : undefined
+                  }
+                  isGeneratingTechPack={isGeneratingTechPack}
+                  selectedRevision={selectedRevision}
+                  techPackGeneratedFor={techPackGeneratedFor}
+                  revisionTechPacks={revisionTechPacks}
+                  productId={productId}
+                />
+              </div>
+            </div>
+
+            {/* Floating Controls */}
+            <FloatingControls
+              showHistory={showHistory}
+              onToggleHistory={toggleHistory}
+            />
+          </div>
+        </div>
+
+        {/* Tech Pack Generation Progress Modal */}
+        <GenerationProgressModal
+          isLoading={isGeneratingTechPack}
+          title="Generating Tech Pack..."
+          description="This may take a few minutes. Our AI is crafting your factory-ready tech pack. Please do not refresh the page until it's ready."
+        />
+
+        {/* 3D Model Viewer Dialog */}
+        <AnimatePresence>
+          {show3DViewer && (
+            <>
+              {/* Backdrop */}
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="fixed inset-0 bg-black/30 backdrop-blur-sm z-50"
+                onClick={() => setShow3DViewer(false)}
+              />
+
+              {/* Modal */}
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                transition={{ duration: 0.15 }}
+                className="fixed inset-0 z-50 flex items-center justify-center p-4"
+              >
+                <div className="w-full max-w-2xl h-[80vh] bg-white rounded-xl shadow-xl border border-gray-200 overflow-hidden flex flex-col">
+                  {/* Header */}
+                  <div className="px-6 py-4 border-b border-gray-200 bg-gray-50/50">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-emerald-100 rounded-lg">
+                          <Box className="h-4 w-4 text-emerald-700" />
+                        </div>
+                        <div>
+                          <h3 className="text-lg font-semibold text-gray-900">
+                            3D Model Viewer
+                          </h3>
+                          <p className="text-xs text-gray-500 mt-0.5">
+                            {extractedProductName || productName}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setShow3DViewer(false)}
+                        className="p-1.5 hover:bg-gray-100 rounded-lg transition-colors"
+                      >
+                        <X className="h-5 w-5 text-gray-500" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Content */}
+                  <div className="flex-1 overflow-y-auto">
+                    {model3DUrl && (
+                      <div className="p-6">
+                        <div className="rounded-lg overflow-hidden border border-gray-200">
+                          <Model3DViewer modelUrl={model3DUrl} />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            </>
+          )}
+        </AnimatePresence>
+      </ErrorBoundary>
+    </div>
+  );
+}
+
+export default MultiViewEditor;
